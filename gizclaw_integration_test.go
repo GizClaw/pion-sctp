@@ -877,3 +877,86 @@ func TestGizClawDCEPStyleBurst(t *testing.T) {
 	// Dropped opens are recovered by retransmission after roughly an RTO.
 	require.Less(t, elapsed, time.Second, "channel opens should finish well within the 1s initial RTO")
 }
+
+// TestGizClawClosedStreamDiscardsBacklog closes a stream on the receiving
+// side without reading it while the peer keeps sending more than the receive
+// window on it, like a WebRTC data channel closed without being drained. The
+// unread data must not hold the association's receive window: it is dropped,
+// the window reopens and other streams keep working. The peer's reset then
+// ends the stream, both reset directions complete, and a new generation on
+// the same stream ID delivers its data normally.
+func TestGizClawClosedStreamDiscardsBacklog(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		interleaving bool
+	}{
+		{name: "DATA", interleaving: false},
+		{name: "I-DATA", interleaving: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runClosedStreamDiscardsBacklog(t, tc.interleaving)
+		})
+	}
+}
+
+func runClosedStreamDiscardsBacklog(t *testing.T, interleaving bool) {
+	t.Helper()
+	const (
+		receiveBuffer = 16 * 1024
+		chunkSize     = 8 * 1024
+		closedID      = uint16(1)
+		otherID       = uint16(2)
+	)
+	link := newGizclawLink(t, gizclawLinkConfig{
+		interleaving: interleaving,
+		serverOpts: []AssociationOption{
+			WithMaxReceiveBufferSize(receiveBuffer),
+			WithDiscardInboundAfterClose(true),
+		},
+	})
+	serverWindow := func() uint32 {
+		link.server.lock.RLock()
+		defer link.server.lock.RUnlock()
+
+		return link.server.getMyReceiverWindowCredit()
+	}
+
+	closedClient, closedServer := link.openPair(closedID)
+	otherClient, otherServer := link.openPair(otherID)
+
+	// The peer keeps sending twice the receive window on a stream the server
+	// never reads.
+	chunk := bytes.Repeat([]byte{'x'}, chunkSize)
+	for range 4 {
+		link.write(closedClient, chunk)
+	}
+	link.await("receive window to fill", func() bool { return serverWindow() < chunkSize })
+
+	require.NoError(t, closedServer.Close())
+	link.await("backlog of the closed stream to drain", func() bool {
+		link.client.lock.RLock()
+		defer link.client.lock.RUnlock()
+
+		return link.client.pendingQueue.size() == 0 && link.client.inflightQueue.size() == 0
+	})
+	link.await("receive window to reopen", func() bool { return serverWindow() == receiveBuffer })
+	link.exchange(otherClient, otherServer, "while closed stream drains")
+
+	// The peer's reset ends the closed stream, and both directions complete.
+	require.NoError(t, closedClient.Close())
+	_, err := link.read(closedServer)
+	require.ErrorIs(t, err, io.EOF)
+	require.Equal(t, closedID, link.awaitReset(link.serverResets, "server"))
+	require.Equal(t, closedID, link.awaitReset(link.clientResets, "client"))
+
+	// A new generation on the same ID must not inherit the discard state.
+	reusedClient, reusedServer := link.openPair(closedID)
+	link.write(reusedClient, chunk)
+	got, err := link.read(reusedServer)
+	require.NoError(t, err)
+	require.Equal(t, chunk, got)
+	link.exchange(reusedClient, reusedServer, "reused")
+	link.exchange(otherClient, otherServer, "after reuse")
+	require.Equal(t, uint32(receiveBuffer), serverWindow())
+	link.requireNoResetEvents()
+}
