@@ -3964,33 +3964,29 @@ func (a *Association) checkPartialReliabilityStatus(chunkPayload *chunkPayloadDa
 		return
 	}
 
-	// PR-SCTP
-	if stream, ok := a.streams[chunkPayload.streamIdentifier]; ok { //nolint:nestif
-		stream.lock.RLock()
-		if stream.reliabilityType == ReliabilityTypeRexmit {
-			if chunkPayload.nSent >= stream.reliabilityValue {
-				chunkPayload.setAbandoned(true)
-				a.rackRemove(chunkPayload)
-				a.log.Tracef(
-					"[%s] marked as abandoned: tsn=%d ppi=%d (remix: %d)",
-					a.name, chunkPayload.tsn, chunkPayload.payloadType, chunkPayload.nSent,
-				)
-			}
-		} else if stream.reliabilityType == ReliabilityTypeTimed {
-			elapsed := int64(time.Since(chunkPayload.since).Seconds() * 1000)
-			if elapsed >= int64(stream.reliabilityValue) {
-				chunkPayload.setAbandoned(true)
-				a.rackRemove(chunkPayload)
-				a.log.Tracef(
-					"[%s] marked as abandoned: tsn=%d ppi=%d (timed: %d)",
-					a.name, chunkPayload.tsn, chunkPayload.payloadType, elapsed,
-				)
-			}
+	// PR-SCTP. Use the policy the message was written with: once the peer
+	// resets its outgoing stream, the stream is no longer registered, but
+	// its outstanding chunks keep their policy.
+	switch chunkPayload.reliabilityType {
+	case ReliabilityTypeRexmit:
+		if chunkPayload.nSent >= chunkPayload.reliabilityValue {
+			chunkPayload.setAbandoned(true)
+			a.rackRemove(chunkPayload)
+			a.log.Tracef(
+				"[%s] marked as abandoned: tsn=%d ppi=%d (remix: %d)",
+				a.name, chunkPayload.tsn, chunkPayload.payloadType, chunkPayload.nSent,
+			)
 		}
-		stream.lock.RUnlock()
-	} else {
-		// Remote has reset its send side of the stream, we can still send data.
-		a.log.Tracef("[%s] stream %d not found, remote reset", a.name, chunkPayload.streamIdentifier)
+	case ReliabilityTypeTimed:
+		elapsed := int64(time.Since(chunkPayload.since).Seconds() * 1000)
+		if elapsed >= int64(chunkPayload.reliabilityValue) {
+			chunkPayload.setAbandoned(true)
+			a.rackRemove(chunkPayload)
+			a.log.Tracef(
+				"[%s] marked as abandoned: tsn=%d ppi=%d (timed: %d)",
+				a.name, chunkPayload.tsn, chunkPayload.payloadType, elapsed,
+			)
+		}
 	}
 }
 
