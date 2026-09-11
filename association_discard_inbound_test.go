@@ -22,6 +22,40 @@ func TestWithDiscardInboundAfterClose(t *testing.T) {
 		assoc.closeWriteLoopOnce.Do(func() { close(assoc.closeWriteLoopCh) })
 		require.Equal(t, enabled, assoc.discardInboundAfterClose)
 	}
+
+	// The setting is kept when a Config built from options is itself passed
+	// as an option.
+	var built Config
+	require.NoError(t, WithDiscardInboundAfterClose(true).applyServer(&built))
+	var server, client Config
+	require.NoError(t, built.applyServer(&server))
+	require.NoError(t, built.applyClient(&client))
+	require.True(t, server.discardInboundAfterClose)
+	require.True(t, client.discardInboundAfterClose)
+}
+
+// Closing a stream after its association closed still drops the unread data
+// but must not try to announce the reopened window.
+func TestStreamDiscardInboundAfterAssociationClosed(t *testing.T) {
+	assoc := createTestAssociationWithOptions(t, Config{}, WithDiscardInboundAfterClose(true))
+	assoc.closeAllTimers()
+	assoc.closeWriteLoopOnce.Do(func() { close(assoc.closeWriteLoopCh) })
+
+	stream := assoc.createStream(1, false)
+	require.NoError(t, stream.handleData(&chunkPayloadData{
+		beginningFragment: true,
+		endingFragment:    true,
+		tsn:               1,
+		streamIdentifier:  1,
+		userData:          []byte("unread"),
+	}))
+	require.NotZero(t, stream.reassemblyQueue.getNumBytes())
+
+	assoc.setState(closed)
+	assoc.ackState = ackStateIdle
+	require.ErrorIs(t, stream.Close(), ErrResetPacketInStateNotExist)
+	require.Zero(t, stream.reassemblyQueue.getNumBytes(), "unread data was not discarded")
+	require.Equal(t, ackStateIdle, assoc.ackState, "a closed association must not schedule a SACK")
 }
 
 // tickUntil forwards packets across br until cond holds.
