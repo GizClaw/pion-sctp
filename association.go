@@ -2525,21 +2525,53 @@ func (a *Association) acceptPayloadData(chunkPayload *chunkPayloadData) bool {
 
 	// Receive buffer is full
 	lastTSN, ok := a.payloadQueue.getLastTSNReceived()
-	if !ok || !sna32LT(chunkPayload.tsn, lastTSN) {
+	if ok && sna32LT(chunkPayload.tsn, lastTSN) {
 		a.log.Debugf(
-			"[%s] receive buffer full. dropping DATA with tsn=%d ssn=%d",
+			"[%s] receive buffer full, but accepted as this is a missing chunk with tsn=%d ssn=%d",
 			a.name, chunkPayload.tsn, chunkPayload.streamSequenceNumber,
 		)
 
-		return true
+		return a.pushPayloadDataToStream(stream, chunkPayload)
+	}
+
+	// When every queued byte belongs to a message that is not yet complete,
+	// the application has nothing to read, so the window can only reopen if
+	// more of those messages arrive. This happens when fragments of several
+	// messages are interleaved (I-DATA) or a single message is larger than
+	// the receive buffer. Dropping the next in-sequence chunk would then
+	// deadlock the association, so accept chunks that advance the cumulative
+	// TSN until a message becomes readable, like dcSCTP does above its high
+	// watermark. The sender keeps probing the closed window one chunk at a
+	// time, so acknowledge each of them without delay.
+	if chunkPayload.tsn == a.peerLastTSN()+1 && !a.hasReadableStream() {
+		a.log.Debugf(
+			"[%s] receive buffer full of incomplete messages, accepted in-sequence DATA with tsn=%d ssn=%d",
+			a.name, chunkPayload.tsn, chunkPayload.streamSequenceNumber,
+		)
+		a.immediateAckTriggered = true
+
+		return a.pushPayloadDataToStream(stream, chunkPayload)
 	}
 
 	a.log.Debugf(
-		"[%s] receive buffer full, but accepted as this is a missing chunk with tsn=%d ssn=%d",
+		"[%s] receive buffer full. dropping DATA with tsn=%d ssn=%d",
 		a.name, chunkPayload.tsn, chunkPayload.streamSequenceNumber,
 	)
 
-	return a.pushPayloadDataToStream(stream, chunkPayload)
+	return true
+}
+
+// hasReadableStream reports whether any stream has a message the application
+// can read now.
+// The caller should hold the lock.
+func (a *Association) hasReadableStream() bool {
+	for _, s := range a.streams {
+		if s.isReadable() {
+			return true
+		}
+	}
+
+	return false
 }
 
 // The caller should hold the lock.
