@@ -543,6 +543,13 @@ func (s *Stream) onBufferReleased(nBytesReleased int) {
 	s.lock.Unlock()
 }
 
+func (s *Stream) isReadable() bool {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	return s.reassemblyQueue.isReadable()
+}
+
 func (s *Stream) getNumBytesInReassemblyQueue() int {
 	// No lock is required as it reads the size with atomic load function.
 	return s.reassemblyQueue.getNumBytes()
