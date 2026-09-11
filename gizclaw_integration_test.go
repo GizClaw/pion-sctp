@@ -749,3 +749,54 @@ func TestGizClawHandshakeRecovery(t *testing.T) {
 	clientStream, serverStream = link.openPair(streamID)
 	link.exchange(clientStream, serverStream, "reused")
 }
+
+// TestGizClawStreamBurstBacklog opens a burst of streams while the server is
+// not accepting, checks that every stream's DATA is acknowledged without
+// T3-rtx, then closes them all from both sides and repeats the burst on the
+// same stream IDs, so queued-but-unaccepted streams are exercised together
+// with serialized resets and stream ID reuse.
+func TestGizClawStreamBurstBacklog(t *testing.T) {
+	const numStreams = 200 // far beyond the former 16-stream accept backlog
+	link := newGizclawLink(t, gizclawLinkConfig{interleaving: true})
+	message := func(round int, id uint16) []byte { return fmt.Appendf(nil, "round %d stream %d", round, id) }
+
+	for round := range 2 {
+		start := time.Now()
+		clientStreams := make([]*Stream, numStreams)
+		for id := range uint16(numStreams) {
+			stream, err := link.client.OpenStream(id, PayloadTypeWebRTCBinary)
+			require.NoError(t, err)
+			link.write(stream, message(round, id))
+			clientStreams[id] = stream
+		}
+		link.await("burst acknowledged without accepting", func() bool { return link.client.BufferedAmount() == 0 })
+		require.Less(t, time.Since(start), time.Second, "round %d: burst needed T3-rtx", round)
+
+		serverStreams := make([]*Stream, numStreams)
+		for range numStreams {
+			stream := link.accept()
+			got, err := link.read(stream)
+			require.NoError(t, err)
+			require.Equal(t, message(round, stream.StreamIdentifier()), got)
+			serverStreams[stream.StreamIdentifier()] = stream
+		}
+
+		for id := range clientStreams {
+			require.NoError(t, clientStreams[id].Close())
+			require.NoError(t, serverStreams[id].Close())
+		}
+		for _, side := range []struct {
+			name   string
+			events chan uint16
+		}{{"client", link.clientResets}, {"server", link.serverResets}} {
+			seen := map[uint16]bool{}
+			for range numStreams {
+				id := link.awaitReset(side.events, side.name)
+				require.False(t, seen[id], "round %d: %s reset for stream %d completed twice", round, side.name, id)
+				seen[id] = true
+			}
+		}
+	}
+	require.Zero(t, link.client.stats.getNumT3Timeouts(), "new streams must not wait for T3-rtx")
+	link.requireNoResetEvents()
+}
