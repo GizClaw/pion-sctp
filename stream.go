@@ -415,6 +415,8 @@ func (s *Stream) packetize(raw []byte, ppi PayloadProtocolIdentifier) ([]*chunkP
 			messageIdentifier:      mid,
 			fragmentSequenceNumber: fsn,
 			iData:                  useInterleaving,
+			reliabilityType:        s.reliabilityType,
+			reliabilityValue:       s.reliabilityValue,
 			head:                   head,
 		}
 

@@ -69,10 +69,12 @@ type chunkPayloadData struct {
 	missIndicator uint32
 
 	// Partial-reliability parameters used only by sender
-	since        time.Time
-	nSent        uint32 // number of transmission made for this chunk
-	_abandoned   bool
-	_allInflight bool // valid only with the first fragment
+	reliabilityType  byte   // stream reliability type when the message was written
+	reliabilityValue uint32 // stream reliability value when the message was written
+	since            time.Time
+	nSent            uint32 // number of transmission made for this chunk
+	_abandoned       bool
+	_allInflight     bool // valid only with the first fragment
 
 	// Retransmission flag set when T1-RTX timeout occurred and this
 	// chunk is still in the inflight queue
