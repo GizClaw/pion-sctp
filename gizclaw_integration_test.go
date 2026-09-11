@@ -800,3 +800,80 @@ func TestGizClawStreamBurstBacklog(t *testing.T) {
 	require.Zero(t, link.client.stats.getNumT3Timeouts(), "new streams must not wait for T3-rtx")
 	link.requireNoResetEvents()
 }
+
+// TestGizClawDCEPStyleBurst reproduces how pion-webrtc opens DataChannels:
+// the client opens a burst of streams and sends a DCEP OPEN on each, while
+// the server runs a single accept loop that reads each OPEN and replies with
+// a DCEP ACK. Writing the ACK needs the association lock the read loop holds
+// while it creates streams, and the application does some work per channel
+// (modeled as acceptWork), so the accept loop falls behind a burst that
+// arrives in a few packets. Every channel must still open promptly, without
+// waiting for any retransmission, and the accept loop must never deadlock
+// with the read loop (pion/sctp#30).
+func TestGizClawDCEPStyleBurst(t *testing.T) {
+	const (
+		numChannels = 150
+		acceptWork  = 2 * time.Millisecond
+	)
+	dcepOpen := []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	dcepAck := []byte{0x02}
+	link := newGizclawLink(t, gizclawLinkConfig{interleaving: true})
+
+	// Server: serial accept loop, as in pion-webrtc's SCTPTransport.
+	acceptLoopDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		for range numChannels {
+			stream, err := link.server.AcceptStream()
+			if err != nil {
+				acceptLoopDone <- err
+
+				return
+			}
+			_, ppi, err := stream.ReadSCTP(buf)
+			if err != nil || ppi != PayloadTypeWebRTCDCEP {
+				acceptLoopDone <- fmt.Errorf("stream %d: read OPEN: ppi=%v err=%w", stream.StreamIdentifier(), ppi, err)
+
+				return
+			}
+			time.Sleep(acceptWork) // create the DataChannel, run callbacks
+			if _, err = stream.WriteSCTP(dcepAck, PayloadTypeWebRTCDCEP); err != nil {
+				acceptLoopDone <- err
+
+				return
+			}
+		}
+		acceptLoopDone <- nil
+	}()
+
+	start := time.Now()
+	channels := make([]*Stream, numChannels)
+	for id := range uint16(numChannels) {
+		stream, err := link.client.OpenStream(id, PayloadTypeWebRTCDCEP)
+		require.NoError(t, err)
+		n, err := stream.WriteSCTP(dcepOpen, PayloadTypeWebRTCDCEP)
+		require.NoError(t, err)
+		require.Equal(t, len(dcepOpen), n)
+		channels[id] = stream
+	}
+	for _, stream := range channels {
+		got, err := link.read(stream)
+		require.NoError(t, err)
+		require.Equal(t, dcepAck, got, "stream %d", stream.StreamIdentifier())
+	}
+	elapsed := time.Since(start)
+
+	var loopErr error
+	link.await("accept loop", func() bool {
+		select {
+		case loopErr = <-acceptLoopDone:
+			return true
+		default:
+			return false
+		}
+	})
+	require.NoError(t, loopErr)
+	require.Zero(t, link.client.stats.getNumT3Timeouts(), "channel opens must not wait for T3-rtx")
+	// Dropped opens are recovered by retransmission after roughly an RTO.
+	require.Less(t, elapsed, time.Second, "channel opens should finish well within the 1s initial RTO")
+}
