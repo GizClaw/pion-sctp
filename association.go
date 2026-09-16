@@ -276,6 +276,8 @@ type Association struct {
 	myNextRSN                    uint32
 	reconfigs                    map[uint32]*chunkReconfig
 	reconfigRequests             map[uint32]*paramOutgoingResetRequest
+	peerNextRSN                  uint32
+	lastReconfigResponse         *packet
 	onStreamResetCompleteHandler func(streamID uint16)
 	streamResetStates            map[uint16]streamResetState
 
@@ -901,6 +903,7 @@ func (a *Association) initWithOutOfBandTokens(localInit *chunkInit, remoteInit *
 	a.payloadQueue.init(remoteInit.initialTSN - 1)
 	a.myMaxNumInboundStreams = min16(localInit.numInboundStreams, remoteInit.numInboundStreams)
 	a.myMaxNumOutboundStreams = min16(localInit.numOutboundStreams, remoteInit.numOutboundStreams)
+	a.peerNextRSN = remoteInit.initialTSN
 	a.setRWND(remoteInit.advertisedReceiverWindowCredit)
 	a.peerVerificationTag = remoteInit.initiateTag
 	a.sourcePort = defaultSCTPSrcDstPort
@@ -2084,6 +2087,8 @@ func (a *Association) handleInit(pkt *packet, initChunk *chunkInit) ([]*packet, 
 	//  https://www.rfc-editor.org/rfc/rfc9260#sec_handle_stream_parameters
 	a.myMaxNumInboundStreams = min16(initChunk.numInboundStreams, a.myMaxNumInboundStreams)
 	a.myMaxNumOutboundStreams = min16(initChunk.numOutboundStreams, a.myMaxNumOutboundStreams)
+	a.peerNextRSN = initChunk.initialTSN
+	a.lastReconfigResponse = nil
 	a.peerVerificationTag = initChunk.initiateTag
 	a.sourcePort = pkt.destinationPort
 	a.destinationPort = pkt.sourcePort
@@ -2180,6 +2185,8 @@ func (a *Association) handleInitAck(pkt *packet, initChunkAck *chunkInitAck) err
 
 	a.myMaxNumInboundStreams = min16(initChunkAck.numInboundStreams, a.myMaxNumInboundStreams)
 	a.myMaxNumOutboundStreams = min16(initChunkAck.numOutboundStreams, a.myMaxNumOutboundStreams)
+	a.peerNextRSN = initChunkAck.initialTSN
+	a.lastReconfigResponse = nil
 	a.peerVerificationTag = initChunkAck.initiateTag
 	a.payloadQueue.init(initChunkAck.initialTSN - 1)
 	if a.sourcePort != pkt.destinationPort ||
@@ -3629,6 +3636,25 @@ func (a *Association) handleReconfigParam(raw param) (*packet, error) {
 	switch par := raw.(type) {
 	case *paramOutgoingResetRequest:
 		a.log.Tracef("[%s] handleReconfigParam (OutgoingResetRequest)", a.name)
+		if pending, ok := a.reconfigRequests[par.reconfigRequestSequenceNumber]; ok {
+			// A retransmission of an accepted request that is still "In
+			// progress": re-evaluate it, the cumulative TSN may have caught up.
+			return a.resetStreamsIfAny(pending), nil
+		}
+		if par.reconfigRequestSequenceNumber != a.peerNextRSN {
+			// RFC 6525 section 5.2.2: a request with the previous RSN is a
+			// retransmission of one we already answered; repeat that answer
+			// without acting on the streams again, which may have been reused.
+			// Any other RSN is out of order.
+			if par.reconfigRequestSequenceNumber == a.peerNextRSN-1 && a.lastReconfigResponse != nil {
+				return a.lastReconfigResponse, nil
+			}
+
+			return a.createReconfigResponse(
+				par.reconfigRequestSequenceNumber,
+				reconfigResultErrorBadSequenceNumber,
+			), nil
+		}
 		if a.peerLastTSN() < par.senderLastTSN && len(a.reconfigRequests) >= maxReconfigRequests {
 			// We have too many reconfig requests outstanding. Drop the request and let
 			// the peer retransmit. A well behaved peer should only have 1 outstanding
@@ -3642,6 +3668,7 @@ func (a *Association) handleReconfigParam(raw param) (*packet, error) {
 			// https://chromium.googlesource.com/external/webrtc/+/refs/heads/main/net/dcsctp/socket/stream_reset_handler.cc#271
 			return nil, fmt.Errorf("%w: %d", ErrTooManyReconfigRequests, len(a.reconfigRequests))
 		}
+		a.peerNextRSN++
 		a.reconfigRequests[par.reconfigRequestSequenceNumber] = par
 		resp := a.resetStreamsIfAny(par)
 		if resp != nil {
@@ -3690,7 +3717,13 @@ func (a *Association) completeOutgoingStreamReset(reconfigRequestSequenceNumber 
 		return
 	}
 	for _, id := range resetRequest.streamIdentifiers {
-		if s, ok := a.streams[id]; ok {
+		// Outgoing resets are only requested by Stream.Close, so the stream
+		// that asked for this one is no longer open. An open stream under the
+		// same identifier is a new generation: the peer may already have seen
+		// the reset complete in both directions and reused the identifier
+		// before this response arrived. Resetting that stream would make it
+		// repeat SSNs/MIDs the peer has already delivered.
+		if s, ok := a.streams[id]; ok && s.State() != StreamStateOpen {
 			s.resetOutgoingStreamSequenceNumbers()
 		}
 		a.completeStreamResetDirection(id, streamResetOutbound)
@@ -3722,9 +3755,19 @@ func (a *Association) resetStreamsIfAny(resetRequest *paramOutgoingResetRequest)
 		result = reconfigResultInProgress
 	}
 
+	response := a.createReconfigResponse(resetRequest.reconfigRequestSequenceNumber, result)
+	if resetRequest.reconfigRequestSequenceNumber == a.peerNextRSN-1 {
+		a.lastReconfigResponse = response
+	}
+
+	return response
+}
+
+// The caller should hold the association lock.
+func (a *Association) createReconfigResponse(sequenceNumber uint32, result reconfigResult) *packet {
 	return a.createPacket([]chunk{&chunkReconfig{
 		paramA: &paramReconfigResponse{
-			reconfigResponseSequenceNumber: resetRequest.reconfigRequestSequenceNumber,
+			reconfigResponseSequenceNumber: sequenceNumber,
 			result:                         result,
 		},
 	}})
