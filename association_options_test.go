@@ -286,6 +286,21 @@ func TestAssociationConfigCopiesStreamLimits(t *testing.T) {
 	assert.Equal(t, numOutbound, clientConfig.NumOutboundStreams)
 }
 
+// The setting survives being carried in a Config that is itself passed as an
+// option, the deprecated configuration path.
+func TestAssociationConfigCopiesHandshakeRTOMax(t *testing.T) {
+	const handshakeRTOMax = 150.0
+
+	var built Config
+	assert.NoError(t, WithHandshakeRTOMax(handshakeRTOMax).applyServer(&built))
+
+	var server, client Config
+	assert.NoError(t, built.applyServer(&server))
+	assert.NoError(t, built.applyClient(&client))
+	assert.Equal(t, handshakeRTOMax, server.HandshakeRTOMax)
+	assert.Equal(t, handshakeRTOMax, client.HandshakeRTOMax)
+}
+
 func TestAssociationRTOMaxStillIncludesHandshakeByDefault(t *testing.T) {
 	assert.Equal(t, float64(250), effectiveHandshakeRTOMax(250, 0))
 	assert.Equal(t, float64(150), effectiveHandshakeRTOMax(1000, 150))
