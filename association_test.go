@@ -6,6 +6,7 @@
 package sctp
 
 import (
+	"bytes"
 	"context"
 	cryptoRand "crypto/rand"
 	"encoding/binary"
@@ -25,7 +26,7 @@ import (
 	"time"
 
 	"github.com/pion/logging"
-	"github.com/pion/transport/v4/test"
+	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1027,7 +1028,7 @@ func TestAssociationInterleavingFinalizedOnEstablishedTransition(t *testing.T) {
 		assoc.peerIForwardTSN = true
 		assoc.setState(cookieEchoed)
 
-		packets := assoc.handleCookieEcho(&chunkCookieEcho{cookie: []byte("cookie")})
+		packets := assoc.handleCookieEcho(&packet{}, &chunkCookieEcho{cookie: []byte("cookie")})
 
 		require.NotEmpty(t, packets)
 		require.Equal(t, established, assoc.getState())
@@ -2716,6 +2717,131 @@ func TestAssocUnreliable(t *testing.T) { //nolint:maintidx
 // A test for this PR https://github.com/pion/sctp/pull/341
 // We drop the first INIT ACK, and we expect the verification tag to be 0 on
 // retransmission.
+// maxRetransmits=N must allow N retransmissions: RFC 7496 Section 3.1 abandons
+// a message only when a retransmission "would exceed the provided limit", and
+// RFC 8832 Section 5.1 says messages "will not be retransmitted more times than
+// specified in the Reliability Parameter".
+func TestAssocUnreliableRexmitLimit(t *testing.T) {
+	for _, tc := range []struct {
+		limit     uint32
+		drops     int
+		sends     int
+		delivered bool
+	}{
+		{limit: 0, drops: 1, sends: 1, delivered: false},
+		{limit: 1, drops: 1, sends: 2, delivered: true},
+		{limit: 1, drops: 2, sends: 2, delivered: false},
+		{limit: 2, drops: 2, sends: 3, delivered: true},
+		{limit: 2, drops: 3, sends: 3, delivered: false},
+	} {
+		t.Run(fmt.Sprintf("limit %d drops %d", tc.limit, tc.drops), func(t *testing.T) {
+			sends, delivered := runRexmitLimit(t, tc.limit, tc.drops)
+			assert.Equal(t, tc.sends, sends, "unexpected number of transmissions")
+			assert.Equal(t, tc.delivered, delivered, "unexpected delivery")
+		})
+	}
+}
+
+// runRexmitLimit writes one message on an unordered stream limited to limit
+// retransmissions, discards the first drops copies of it on the wire, and
+// reports how many copies were sent and whether the message was delivered.
+func runRexmitLimit(t *testing.T, limit uint32, drops int) (int, bool) { //nolint:cyclop
+	t.Helper()
+
+	lim := test.TimeOut(time.Second * 10)
+	defer lim.Stop()
+
+	br := test.NewBridge()
+
+	a0, a1, err := createNewAssociationPair(br, ackModeNoDelay, 0)
+	assert.NoError(t, err, "failed to create associations")
+
+	s0, s1, err := establishSessionPair(br, a0, a1, 1)
+	assert.NoError(t, err, "failed to establish session pair")
+	defer closeAssociationPair(br, a0, a1)
+
+	// Keep the T3-rtx retransmissions well inside the observation window.
+	a0.rtoMgr.setRTO(50.0, true)
+
+	s0.SetReliabilityParams(true, ReliabilityTypeRexmit, limit)
+
+	const msgSize = 1000
+	var (
+		mu        sync.Mutex
+		target    uint32
+		hasTarget bool
+		sends     int
+	)
+	br.Filter(0, func(raw []byte) bool {
+		p := &packet{}
+		if p.unmarshal(true, raw) != nil {
+			return true
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, c := range p.chunks {
+			data, ok := c.(*chunkPayloadData)
+			if !ok || len(data.userData) != msgSize {
+				continue
+			}
+			if !hasTarget {
+				target, hasTarget = data.tsn, true
+			}
+			if data.tsn == target {
+				sends++
+
+				return sends > drops
+			}
+		}
+
+		return true
+	})
+	countSends := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return sends
+	}
+
+	var delivered atomic.Int32
+	go func() {
+		buf := make([]byte, 2000)
+		for {
+			n, _, readErr := s1.ReadSCTP(buf)
+			if readErr != nil {
+				return
+			}
+			if n == msgSize {
+				delivered.Add(1)
+			}
+		}
+	}()
+
+	_, err = s0.WriteSCTP(make([]byte, msgSize), PayloadTypeWebRTCBinary)
+	assert.NoError(t, err)
+	for countSends() == 0 {
+		br.Tick()
+		time.Sleep(time.Millisecond)
+	}
+
+	// Followers, sent after the message, make the receiver report the gap.
+	for range 4 {
+		_, err = s0.WriteSCTP(make([]byte, 10), PayloadTypeWebRTCBinary)
+		assert.NoError(t, err)
+	}
+
+	// Long enough for every allowed retransmission, and for one more to show.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		br.Tick()
+		time.Sleep(time.Millisecond)
+	}
+
+	return countSends(), delivered.Load() == 1
+}
+
 func TestInitVerificationTagIsZero(t *testing.T) { //nolint:cyclop
 	lim := test.TimeOut(time.Second * 10)
 	defer lim.Stop()
@@ -4776,7 +4902,7 @@ func TestAssocAbort(t *testing.T) {
 	packet, err := a0.marshalPacket(a0.createPacket([]chunk{abort}))
 	assert.NoError(t, err)
 
-	_, _, err = establishSessionPair(br, a0, a1, si)
+	_, remoteStream, err := establishSessionPair(br, a0, a1, si)
 	assert.NoError(t, err)
 
 	// Both associations are established
@@ -4793,6 +4919,10 @@ func TestAssocAbort(t *testing.T) {
 	// The receiving association should be closed because it got an ABORT
 	assert.Equal(t, established, a0.getState())
 	assert.Equal(t, closed, a1.getState())
+
+	_, err = remoteStream.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, ErrChunk)
+	assert.False(t, errors.Is(err, ErrUserInitiatedAbort))
 
 	closeAssociationPair(br, a0, a1)
 }
@@ -4983,8 +5113,40 @@ func TestAssocHandleInit(t *testing.T) {
 		handleInitTest(t, closed, false)
 	})
 
-	t.Run("unexpected state established", func(t *testing.T) {
+	t.Run("unexpected new association in established state", func(t *testing.T) {
 		handleInitTest(t, established, true)
+	})
+
+	t.Run("duplicate init in established state", func(t *testing.T) {
+		assoc := createTestAssociation(t, Config{
+			NetConn:       &dumbConn{},
+			LoggerFactory: loggerFactory,
+		})
+		assoc.setState(established)
+		assoc.sourcePort = 5002
+		assoc.destinationPort = 5001
+		assoc.peerVerificationTag = 5678
+		assoc.payloadQueue.init(99)
+		pkt := &packet{
+			sourcePort:      5001,
+			destinationPort: 5002,
+		}
+		init := &chunkInit{
+			chunkInitCommon: chunkInitCommon{
+				initialTSN:                     1234,
+				numOutboundStreams:             1001,
+				numInboundStreams:              1002,
+				initiateTag:                    5678,
+				advertisedReceiverWindowCredit: 512 * 1024,
+			},
+		}
+
+		packets, err := assoc.handleInit(pkt, init)
+		require.NoError(t, err)
+		assert.Empty(t, packets)
+		assert.Equal(t, established, assoc.getState())
+		assert.Equal(t, uint32(5678), assoc.peerVerificationTag)
+		assert.Equal(t, uint32(99), assoc.peerLastTSN())
 	})
 
 	t.Run("shutdownAckSent matching ports retransmits shutdown ack", func(t *testing.T) {
@@ -5761,7 +5923,7 @@ func createAssocs() (*Association, *Association, error) { //nolint:cyclop
 	defer cancel()
 
 	go func() {
-		a, err2 := createClientWithContext(ctx, Config{
+		a, err2 := ClientContext(ctx, Config{
 			NetConn:       udp1,
 			LoggerFactory: loggerFactory,
 		})
@@ -5773,7 +5935,7 @@ func createAssocs() (*Association, *Association, error) { //nolint:cyclop
 	}()
 
 	go func() {
-		a, err2 := createClientWithContext(ctx, Config{
+		a, err2 := ClientContext(ctx, Config{
 			NetConn:       udp2,
 			LoggerFactory: loggerFactory,
 		})
@@ -5856,7 +6018,7 @@ func createAssociationPairWithConfig(
 		cfg := config
 		cfg.NetConn = udpConn1
 		cfg.LoggerFactory = loggerFactory
-		a, err2 := createClientWithContext(ctx, cfg)
+		a, err2 := ClientContext(ctx, cfg)
 		if err2 != nil {
 			a1Chan <- err2
 		} else {
@@ -5871,7 +6033,7 @@ func createAssociationPairWithConfig(
 		if cfg.MaxReceiveBufferSize == 0 {
 			cfg.MaxReceiveBufferSize = 100_000
 		}
-		a, err2 := createClientWithContext(ctx, cfg)
+		a, err2 := ClientContext(ctx, cfg)
 		if err2 != nil {
 			a2Chan <- err2
 		} else {
@@ -6692,71 +6854,224 @@ func TestAssociation_Abort(t *testing.T) {
 
 	i, err = s21.Read(buf)
 	assert.Equal(t, i, 0, "expected no data read")
-	assert.Error(t, err, "User Initiated Abort: 1234", "expected abort reason")
+	assert.ErrorContains(t, err, "(User Initiated Abort: 1234)")
+	assert.ErrorIs(t, err, ErrChunk)
+	assert.ErrorIs(t, err, ErrUserInitiatedAbort)
 }
 
-// TestAssociation_createClientWithContext tests that the client is closed when the context is canceled.
-func TestAssociation_createClientWithContext(t *testing.T) {
-	// Limit runtime in case of deadlocks
-	lim := test.TimeOut(time.Second * 5)
-	defer lim.Stop()
+// clientContextConn signals when the handshake starts and can block deadline updates.
+type clientContextConn struct {
+	net.Conn
+	writeStarted    chan struct{}
+	deadlineBlocked chan struct{}
+	writeOnce       sync.Once
+}
 
-	checkGoroutineLeaks(t)
+// Write signals that the client has started sending its handshake.
+func (c *clientContextConn) Write(packet []byte) (int, error) {
+	c.writeOnce.Do(func() { close(c.writeStarted) })
 
-	udp1, udp2 := createUDPConnPair()
+	return c.Conn.Write(packet)
+}
 
-	loggerFactory := logging.NewDefaultLoggerFactory()
-
-	errCh1 := make(chan error)
-	errCh2 := make(chan error)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-
-	go func() {
-		_, err2 := createClientWithContext(ctx, Config{
-			NetConn:       udp1,
-			LoggerFactory: loggerFactory,
-		})
-		if err2 != nil {
-			errCh1 <- err2
-		} else {
-			errCh1 <- nil
-		}
-	}()
-
-	go func() {
-		_, err2 := createClientWithContext(ctx, Config{
-			NetConn:       udp2,
-			LoggerFactory: loggerFactory,
-		})
-		if err2 != nil {
-			errCh2 <- err2
-		} else {
-			errCh2 <- nil
-		}
-	}()
-
-	// Cancel the context immediately
-	cancel()
-
-	var err1 error
-	var err2 error
-loop:
-	for {
-		select {
-		case err1 = <-errCh1:
-			if err1 != nil && err2 != nil {
-				break loop
-			}
-		case err2 = <-errCh2:
-			if err1 != nil && err2 != nil {
-				break loop
-			}
-		}
+// SetReadDeadline optionally waits before forwarding the deadline to the connection.
+func (c *clientContextConn) SetReadDeadline(deadline time.Time) error {
+	if c.deadlineBlocked != nil {
+		<-c.deadlineBlocked
 	}
 
-	assert.Error(t, err1, "context canceled")
-	assert.Error(t, err2, "context canceled")
+	return c.Conn.SetReadDeadline(deadline)
+}
+
+// clientContextLoggerFactory runs a callback at a deterministic point during setup.
+type clientContextLoggerFactory struct {
+	logging.LoggerFactory
+	onCreate func()
+}
+
+// NewLogger invokes the setup callback before creating the association logger.
+func (f clientContextLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
+	f.onCreate()
+
+	return f.LoggerFactory.NewLogger(scope)
+}
+
+// requirePipeClosed observes library cleanup without causing a read timeout itself.
+func requirePipeClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		return errors.Is(conn.SetReadDeadline(time.Time{}), io.ErrClosedPipe)
+	}, time.Second, time.Millisecond, "ClientContext did not close the connection")
+}
+
+func TestClientContextAlreadyDone(t *testing.T) {
+	checkGoroutineLeaks(t)
+
+	init, err := GenerateOutOfBandToken(Config{})
+	require.NoError(t, err)
+
+	for _, snap := range []bool{false, true} {
+		t.Run(map[bool]string{false: "handshake", true: "SNAP"}[snap], func(t *testing.T) {
+			conn, peer := net.Pipe()
+			t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+			t.Cleanup(func() { assert.NoError(t, peer.Close()) })
+
+			created := false
+			opts := []ClientOption{WithNetConn(conn), WithLoggerFactory(clientContextLoggerFactory{
+				LoggerFactory: logging.NewDefaultLoggerFactory(),
+				onCreate:      func() { created = true },
+			})}
+			if snap {
+				opts = append(opts, WithSNAP(init, init))
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			assoc, err := ClientContext(ctx, opts...)
+			assert.ErrorIs(t, err, context.Canceled)
+			assert.Nil(t, assoc)
+			assert.False(t, created, "a canceled context must not start an association")
+			assert.NoError(t, conn.SetReadDeadline(time.Now()), "the caller still owns the connection")
+		})
+	}
+}
+
+func TestClientContextCancelBlockingConnection(t *testing.T) {
+	for _, blockDeadline := range []bool{false, true} {
+		t.Run(map[bool]string{false: "Close", true: "SetReadDeadline"}[blockDeadline], func(t *testing.T) {
+			checkGoroutineLeaks(t)
+
+			underlying := newBlockingCloseConn()
+			t.Cleanup(func() { close(underlying.closeBlocked) })
+			conn := &clientContextConn{Conn: underlying, writeStarted: make(chan struct{})}
+			if blockDeadline {
+				conn.deadlineBlocked = make(chan struct{})
+				t.Cleanup(func() { close(conn.deadlineBlocked) })
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			result := make(chan error, 1)
+			optionCalls := 0
+			go func() {
+				assoc, err := ClientContext(ctx, WithNetConn(conn), sharedOption(func(*Config) error {
+					optionCalls++
+
+					return nil
+				}))
+				assert.Nil(t, assoc)
+				result <- err
+			}()
+
+			select {
+			case <-conn.writeStarted:
+			case <-time.After(time.Second):
+				require.FailNow(t, "the client did not start its handshake")
+			}
+			cancel()
+
+			select {
+			case err := <-result:
+				assert.ErrorIs(t, err, context.Canceled)
+				assert.Equal(t, 1, optionCalls, "client options must be applied once")
+			case <-time.After(time.Second):
+				require.FailNow(t, "ClientContext waited for a blocked connection")
+			}
+		})
+	}
+}
+
+// clientContextShutdownConn simulates a transport that sends a notification during Close.
+type clientContextShutdownConn struct {
+	net.Conn
+	shutdownResult chan error
+}
+
+// Close attempts the shutdown write before closing the underlying connection.
+func (c *clientContextShutdownConn) Close() error {
+	_, err := c.Conn.Write([]byte("close"))
+	c.shutdownResult <- err
+
+	return c.Conn.Close()
+}
+
+func TestClientContextCancelShutdownWrite(t *testing.T) {
+	checkGoroutineLeaks(t)
+
+	underlying, peer := net.Pipe()
+	t.Cleanup(func() { assert.NoError(t, underlying.Close()) })
+	t.Cleanup(func() { assert.NoError(t, peer.Close()) })
+	transport := &clientContextShutdownConn{Conn: underlying, shutdownResult: make(chan error, 1)}
+	conn := &clientContextConn{Conn: transport, writeStarted: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	result := make(chan error, 1)
+	go func() {
+		assoc, err := ClientContext(ctx, WithNetConn(conn))
+		assert.Nil(t, assoc)
+		result <- err
+	}()
+
+	// Keep the peer unread so both the handshake and shutdown writes would block.
+	select {
+	case <-conn.writeStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "the client did not start its handshake")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow(t, "ClientContext waited for a blocked write")
+	}
+	select {
+	case err := <-transport.shutdownResult:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(time.Second):
+		require.FailNow(t, "the shutdown write did not observe a write deadline")
+	}
+	requirePipeClosed(t, underlying)
+}
+
+func TestClientContextSNAPCanceledDuringSetup(t *testing.T) {
+	checkGoroutineLeaks(t)
+
+	init, err := GenerateOutOfBandToken(Config{})
+	require.NoError(t, err)
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+	t.Cleanup(func() { assert.NoError(t, peer.Close()) })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	assoc, err := ClientContext(ctx, WithNetConn(conn), WithSNAP(init, init),
+		WithLoggerFactory(clientContextLoggerFactory{
+			LoggerFactory: logging.NewDefaultLoggerFactory(),
+			onCreate:      cancel,
+		}))
+	if assoc != nil {
+		t.Cleanup(func() { assert.NoError(t, assoc.Close()) })
+	}
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, assoc)
+	requirePipeClosed(t, conn)
+}
+
+func TestClientContextDeadlineExceeded(t *testing.T) {
+	checkGoroutineLeaks(t)
+
+	conn, peer := net.Pipe()
+	t.Cleanup(func() { assert.NoError(t, conn.Close()) })
+	t.Cleanup(func() { assert.NoError(t, peer.Close()) })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	assoc, err := ClientContext(ctx, WithNetConn(conn))
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Nil(t, assoc)
+	requirePipeClosed(t, conn)
 }
 
 type customLogger struct {
@@ -7013,31 +7328,29 @@ func TestAssociation_BlockWrite(t *testing.T) {
 	// test write deadline
 	// a2's awnd is 0, so write should be blocked
 	require.NoError(t, s1.SetWriteDeadline(time.Now().Add(100*time.Millisecond)))
-	_, err = s1.WriteSCTP(data, PayloadTypeWebRTCBinary)
-	require.ErrorIs(t, err, context.DeadlineExceeded, err)
+	n, err = s1.WriteSCTP(data, PayloadTypeWebRTCBinary)
+	require.Zero(t, n)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
 	// test write deadline cancel
 	require.NoError(t, s1.SetWriteDeadline(time.Time{}))
 	var deadLineCanceled atomic.Bool
-	writeCanceled := make(chan struct{}, 2)
+	writeCanceled := make(chan error, 2)
 	// both write should be blocked and canceled by deadline
-	go func() {
-		_, err1 := s1.WriteSCTP(data, PayloadTypeWebRTCBinary)
-		require.ErrorIs(t, err, context.DeadlineExceeded, err1)
-		require.True(t, deadLineCanceled.Load())
-		writeCanceled <- struct{}{}
-	}()
-	go func() {
-		_, err1 := s1.WriteSCTP(data, PayloadTypeWebRTCBinary)
-		require.ErrorIs(t, err, context.DeadlineExceeded, err1)
-		require.True(t, deadLineCanceled.Load())
-		writeCanceled <- struct{}{}
-	}()
+	for range 2 {
+		go func() {
+			written, writeErr := s1.WriteSCTP(data, PayloadTypeWebRTCBinary)
+			assert.Zero(t, written)
+			assert.True(t, deadLineCanceled.Load())
+			writeCanceled <- writeErr
+		}()
+	}
 	time.Sleep(100 * time.Millisecond)
 	deadLineCanceled.Store(true)
 	require.NoError(t, s1.SetWriteDeadline(time.Now().Add(-1*time.Second)))
-	<-writeCanceled
-	<-writeCanceled
+	for range 2 {
+		require.ErrorIs(t, <-writeCanceled, context.DeadlineExceeded)
+	}
 	require.NoError(t, s1.SetWriteDeadline(time.Time{}))
 
 	rn, rerr := s2.Read(data)
@@ -7563,31 +7876,77 @@ func TestHandleSack_ReversedGapDoesNotPartiallyProcess(t *testing.T) {
 }
 
 func TestHandleSackCreditsOriginalStreamAfterIDReuse(t *testing.T) {
-	assoc := newRackTestAssoc(t)
-	t.Cleanup(assoc.closeAllTimers)
-	assoc.setRWND(1024)
-
 	const streamID = 1
-	oldStream := assoc.createStream(streamID, false)
-	oldStream.bufferedAmount = 1
-	chunk := mkChunk(100, time.Now())
-	chunk.stream = oldStream
-	assoc.inflightQueue.pushNoCheck(chunk)
 
-	delete(assoc.streams, streamID)
-	newStream := assoc.createStream(streamID, false)
-	newStream.bufferedAmount = 7
+	// newGeneration removes the stream that sent chunks 100 and 101 and
+	// reuses its identifier for a new stream with its own buffered bytes.
+	newGeneration := func(t *testing.T) (*Association, *Stream, *Stream) {
+		t.Helper()
+		assoc := newRackTestAssoc(t)
+		t.Cleanup(assoc.closeAllTimers)
+		assoc.setRWND(1024)
 
-	assoc.lock.Lock()
-	err := assoc.handleSack(&chunkSelectiveAck{
-		cumulativeTSNAck:               100,
-		advertisedReceiverWindowCredit: 1024,
+		oldStream := assoc.createStream(streamID, false)
+		oldStream.bufferedAmount = 2
+		for _, tsn := range []uint32{100, 101} {
+			chunk := mkChunk(tsn, time.Now())
+			chunk.stream = oldStream
+			assoc.inflightQueue.pushNoCheck(chunk)
+		}
+
+		delete(assoc.streams, streamID)
+		newStream := assoc.createStream(streamID, false)
+		newStream.bufferedAmount = 7
+
+		return assoc, oldStream, newStream
+	}
+	sack := func(t *testing.T, assoc *Association, sack *chunkSelectiveAck) {
+		t.Helper()
+		sack.advertisedReceiverWindowCredit = 1024
+		assoc.lock.Lock()
+		err := assoc.handleSack(sack)
+		assoc.lock.Unlock()
+		require.NoError(t, err)
+	}
+
+	t.Run("cumulative ack", func(t *testing.T) {
+		assoc, oldStream, newStream := newGeneration(t)
+		sack(t, assoc, &chunkSelectiveAck{cumulativeTSNAck: 101})
+
+		assert.Zero(t, oldStream.BufferedAmount())
+		assert.Equal(t, uint64(7), newStream.BufferedAmount())
 	})
-	assoc.lock.Unlock()
 
-	require.NoError(t, err)
-	assert.Zero(t, oldStream.BufferedAmount())
-	assert.Equal(t, uint64(7), newStream.BufferedAmount())
+	t.Run("gap ack block", func(t *testing.T) {
+		assoc, oldStream, newStream := newGeneration(t)
+		sack(t, assoc, &chunkSelectiveAck{
+			cumulativeTSNAck: 99,
+			gapAckBlocks:     []gapAckBlock{{start: 2, end: 2}},
+		})
+
+		assert.Equal(t, uint64(1), oldStream.BufferedAmount())
+		assert.Equal(t, uint64(7), newStream.BufferedAmount())
+	})
+
+	t.Run("sender stream no longer known", func(t *testing.T) {
+		assoc := newRackTestAssoc(t)
+		t.Cleanup(assoc.closeAllTimers)
+		assoc.setRWND(1024)
+		for _, tsn := range []uint32{100, 101, 102} {
+			assoc.inflightQueue.pushNoCheck(mkChunk(tsn, time.Now()))
+		}
+		other := assoc.createStream(streamID+1, false)
+		other.bufferedAmount = 7
+
+		sack(t, assoc, &chunkSelectiveAck{
+			cumulativeTSNAck: 100,
+			gapAckBlocks:     []gapAckBlock{{start: 2, end: 2}},
+		})
+		sack(t, assoc, &chunkSelectiveAck{cumulativeTSNAck: 102})
+
+		assert.Equal(t, uint64(7), other.BufferedAmount())
+		assert.Zero(t, assoc.inflightQueue.size())
+	})
 }
 
 func TestProcessSelectiveAck_CumulativeTSNWrap(t *testing.T) {
@@ -8340,7 +8699,10 @@ func TestAssociationSNAP(t *testing.T) {
 	initB, err := GenerateOutOfBandToken(tokenConfig)
 	assert.NoError(t, err)
 
-	assocA, err := ClientWithOptions(
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	assocA, err := ClientContext(ctx,
 		WithName("a"),
 		WithNetConn(br.GetConn0()),
 		WithLoggerFactory(loggerFactory),
@@ -8355,6 +8717,9 @@ func TestAssociationSNAP(t *testing.T) {
 		WithSNAP(initB, initA))
 	assert.NoError(t, err)
 	assert.NotNil(t, assocB)
+
+	// The context only controls setup; established associations remain usable.
+	cancel()
 
 	const si uint16 = 1
 	const msg = "SNAP is snappy"
@@ -8567,5 +8932,100 @@ func TestSelectiveAckMTU(t *testing.T) {
 			require.Equal(t, tc.gaps, queue.size())
 			require.Len(t, queue.getGapAckBlocks(queue.size()), tc.gaps)
 		})
+	}
+}
+
+// Replace one endpoint on the same UDP port while retaining the other
+// Association object.
+func TestAssociationPeerRestartEndToEnd(t *testing.T) {
+	persistent, peer, err := association(t, pipeDump, WithEnableInterleaving(true), WithEnableZeroChecksum(true), WithBlockWrite(true))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = persistent.Close() })
+	t.Cleanup(func() { _ = peer.Close() })
+	var previous *Stream
+	for generation, interleaving := range []bool{true, true, false, true} {
+		zeroChecksum := generation == 0 || generation == 3
+		if generation != 0 {
+			require.Eventually(t, func() bool { return previous.BufferedAmount() == 0 }, time.Second, time.Millisecond)
+			persistent.lock.Lock()
+			persistent.writePending = true
+			persistent.lock.Unlock()
+			released := make(chan uint64, 1)
+			previous.OnBufferedAmountLow(func() { released <- previous.BufferedAmount() })
+			interrupted := make(chan error, 1)
+			go func() {
+				_, writeErr := previous.Write([]byte("interrupted by restart"))
+				interrupted <- writeErr
+			}()
+			require.Eventually(t, func() bool { return previous.BufferedAmount() != 0 }, time.Second, time.Millisecond)
+			local, ok := peer.netConn.LocalAddr().(*net.UDPAddr)
+			require.True(t, ok)
+			remote, ok := peer.netConn.RemoteAddr().(*net.UDPAddr)
+			require.True(t, ok)
+			require.NoError(t, peer.Close())
+			conn, err := net.DialUDP("udp4", local, remote)
+			require.NoError(t, err)
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			replacement, err := ClientWithOptions(WithNetConn(conn),
+				WithEnableInterleaving(interleaving), WithEnableZeroChecksum(zeroChecksum))
+			require.NoError(t, err)
+			peer = replacement
+			require.NoError(t, conn.SetReadDeadline(time.Time{}))
+			select {
+			case writeErr := <-interrupted:
+				require.ErrorIs(t, writeErr, ErrAssociationRestarted)
+			case <-time.After(5 * time.Second):
+				require.FailNow(t, "old write did not unblock on restart")
+			}
+			select {
+			case amount := <-released:
+				require.Zero(t, amount)
+			case <-time.After(time.Second):
+				require.FailNow(t, "discarded data did not release the buffered amount")
+			}
+			previous.OnBufferedAmountLow(nil)
+			require.Zero(t, previous.BufferedAmount())
+			require.Equal(t, StreamStateOpen, previous.State())
+		}
+		outbound, err := peer.OpenStream(0, PayloadTypeWebRTCBinary)
+		require.NoError(t, err)
+		inbound, err := persistent.OpenStream(0, PayloadTypeWebRTCBinary)
+		require.NoError(t, err)
+		require.NoError(t, outbound.SetReadDeadline(time.Now().Add(5*time.Second)))
+		require.NoError(t, inbound.SetReadDeadline(time.Now().Add(5*time.Second)))
+		require.NoError(t, inbound.SetWriteDeadline(time.Now().Add(5*time.Second)))
+		if previous != nil {
+			require.Same(t, previous, inbound)
+		}
+		payload := bytes.Repeat([]byte{byte(generation), 42}, 1536)
+		for _, pair := range [][2]*Stream{{outbound, inbound}, {inbound, outbound}} {
+			_, err = pair[0].Write(payload)
+			require.NoError(t, err)
+			received := make([]byte, len(payload))
+			n, err := pair[1].Read(received)
+			require.NoError(t, err)
+			require.Equal(t, payload, received[:n])
+		}
+		previous = inbound
+	}
+}
+
+func TestAssociationRestartRejectsStaleWriteWhileBlocked(t *testing.T) {
+	a := &Association{
+		state: established, blockWrite: true, restartGeneration: 1,
+		writePending: true, writeNotify: make(chan struct{}, 1),
+	}
+	notify := a.writeNotify
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := a.sendPayloadData(ctx, []*chunkPayloadData{{associationGeneration: 0}})
+	require.ErrorIs(t, err, ErrAssociationRestarted)
+	require.True(t, a.writePending, "the new write must remain pending")
+	require.Equal(t, notify, a.writeNotify)
+	select {
+	case <-notify:
+		assert.Fail(t, "rejecting an old write must not unblock new writes")
+	default:
 	}
 }
