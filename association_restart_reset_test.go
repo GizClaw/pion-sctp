@@ -13,7 +13,10 @@ import (
 
 func TestPeerRestartDiscardsPreviousResetGeneration(t *testing.T) {
 	assoc := newRackTestAssoc(t)
-	t.Cleanup(assoc.closeAllTimers)
+	t.Cleanup(func() {
+		assoc.closeAllTimers()
+		assoc.closeWriteLoopOnce.Do(func() { close(assoc.closeWriteLoopCh) })
+	})
 	completions := 0
 	assoc.OnStreamResetComplete(func(uint16) { completions++ })
 	assoc.lock.Lock()
