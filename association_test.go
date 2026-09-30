@@ -9070,7 +9070,9 @@ func TestSelectiveAckMTU(t *testing.T) {
 // Replace one endpoint on the same UDP port while retaining the other
 // Association object.
 func TestAssociationPeerRestartEndToEnd(t *testing.T) {
-	persistent, peer, err := association(t, pipeDump, WithEnableInterleaving(true), WithEnableZeroChecksum(true), WithBlockWrite(true))
+	persistent, peer, err := associationWithClientServerOptions(t, pipeDump,
+		[]ClientOption{WithEnableInterleaving(true), WithEnableZeroChecksum(true), WithBlockWrite(true), WithNumStreams(3, 4)},
+		[]ServerOption{WithEnableInterleaving(true), WithEnableZeroChecksum(true), WithBlockWrite(true), WithNumStreams(11, 12)})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = persistent.Close() })
 	t.Cleanup(func() { _ = peer.Close() })
@@ -9099,7 +9101,7 @@ func TestAssociationPeerRestartEndToEnd(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 			replacement, err := ClientWithOptions(WithNetConn(conn),
-				WithEnableInterleaving(interleaving), WithEnableZeroChecksum(zeroChecksum))
+				WithEnableInterleaving(interleaving), WithEnableZeroChecksum(zeroChecksum), WithNumStreams(11, 12))
 			require.NoError(t, err)
 			peer = replacement
 			require.NoError(t, conn.SetReadDeadline(time.Time{}))
@@ -9119,6 +9121,14 @@ func TestAssociationPeerRestartEndToEnd(t *testing.T) {
 			require.Zero(t, previous.BufferedAmount())
 			require.Equal(t, StreamStateOpen, previous.State())
 		}
+		metadata, ok := persistent.Metadata()
+		require.True(t, ok)
+		require.Equal(t, uint16(3), metadata.NumInboundStreams)
+		require.Equal(t, uint16(4), metadata.NumOutboundStreams)
+		peerMetadata, ok := peer.Metadata()
+		require.True(t, ok)
+		require.Equal(t, metadata.NumOutboundStreams, peerMetadata.NumInboundStreams)
+		require.Equal(t, metadata.NumInboundStreams, peerMetadata.NumOutboundStreams)
 		outbound, err := peer.OpenStream(0, PayloadTypeWebRTCBinary)
 		require.NoError(t, err)
 		inbound, err := persistent.OpenStream(0, PayloadTypeWebRTCBinary)
