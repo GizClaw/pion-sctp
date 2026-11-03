@@ -960,3 +960,181 @@ func runClosedStreamDiscardsBacklog(t *testing.T, interleaving bool) {
 	require.Equal(t, uint32(receiveBuffer), serverWindow())
 	link.requireNoResetEvents()
 }
+
+func TestGizClawRACKRecoversLostRetry(t *testing.T) {
+	for _, interleaving := range []bool{false, true} {
+		mode := "DATA"
+		if interleaving {
+			mode = "I-DATA"
+		}
+		for _, lifetime := range []uint32{0, 500, 1000} {
+			policy := "reliable"
+			if lifetime != 0 {
+				policy = fmt.Sprintf("timed%d", lifetime)
+			}
+			t.Run(mode+"/"+policy, func(t *testing.T) {
+				runGizClawRACKLostRetry(t, interleaving, lifetime)
+			})
+		}
+	}
+}
+
+// runGizClawRACKLostRetry uses real association read/write loops and delayed
+// packet delivery. Neither retransmission flags nor recovery callbacks are
+// driven by the test: later DATA/SACK traffic must recover both lost attempts.
+func runGizClawRACKLostRetry(t *testing.T, interleaving bool, lifetime uint32) { //nolint:cyclop,maintidx
+	t.Helper()
+	const (
+		oneWayDelay   = 150 * time.Millisecond
+		writeInterval = 20 * time.Millisecond
+		recoveryBound = 950 * time.Millisecond
+		messageCount  = 30
+	)
+	link := newGizclawLink(t, gizclawLinkConfig{interleaving: interleaving})
+	sender, err := link.client.OpenStream(1, PayloadTypeWebRTCBinary)
+	require.NoError(t, err)
+	receiver, err := link.server.OpenStream(1, PayloadTypeWebRTCBinary)
+	require.NoError(t, err)
+	if lifetime != 0 {
+		sender.SetReliabilityParams(false, ReliabilityTypeTimed, lifetime)
+	}
+
+	type delayedPacket struct {
+		due time.Time
+		raw []byte
+	}
+	var queued [2][]delayedPacket
+	var attempts []time.Time
+	var targetTSN uint32
+	var targetFound, sentForwardTSN bool
+	wireTypeMatches := true
+	for from := range 2 {
+		link.setHook(from, func(pkt *packet) bool {
+			now := time.Now()
+			for _, c := range pkt.chunks {
+				switch data := c.(type) {
+				case *chunkPayloadData:
+					wireTypeMatches = wireTypeMatches && data.isIData() == interleaving
+					if from == 0 && string(data.userData) == "ordered-00" {
+						if !targetFound {
+							targetTSN, targetFound = data.tsn, true
+						}
+						if data.tsn == targetTSN {
+							attempts = append(attempts, now)
+							if len(attempts) <= 2 {
+								return false
+							}
+						}
+					}
+				case *chunkForwardTSN, *chunkIForwardTSN:
+					sentForwardTSN = true
+				}
+			}
+			queued[from] = append(queued[from], delayedPacket{due: now.Add(oneWayDelay), raw: rawPacket(pkt)})
+
+			return false
+		})
+	}
+	// Cleanup must bypass the delay queues once the test stops ticking them.
+	t.Cleanup(func() {
+		link.setHook(0, nil)
+		link.setHook(1, nil)
+	})
+	tick := func() {
+		var due [2][][]byte
+		link.locked(func() {
+			now := time.Now()
+			for from := range 2 {
+				for len(queued[from]) > 0 && !now.Before(queued[from][0].due) {
+					due[from] = append(due[from], queued[from][0].raw)
+					queued[from] = queued[from][1:]
+				}
+			}
+		})
+		for from, raws := range due {
+			for _, raw := range raws {
+				link.inject(from, raw)
+			}
+		}
+		link.tick()
+	}
+	await := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !cond() {
+			require.True(t, time.Now().Before(deadline), "timed out waiting for %s", what)
+			tick()
+		}
+	}
+	readable := func() bool {
+		receiver.lock.RLock()
+		defer receiver.lock.RUnlock()
+
+		return receiver.reassemblyQueue.isReadable()
+	}
+	read := func() string {
+		t.Helper()
+		buf := make([]byte, 128)
+		n, ppi, readErr := receiver.ReadSCTP(buf)
+		require.NoError(t, readErr)
+		require.Equal(t, PayloadTypeWebRTCBinary, ppi)
+
+		return string(buf[:n])
+	}
+
+	// Learn RTT from an unretransmitted DATA/SACK exchange on this link.
+	link.write(sender, []byte("RTT probe"))
+	await("RTT probe delivery", readable)
+	require.Equal(t, "RTT probe", read())
+	await("RTT probe acknowledgement", func() bool { return sender.BufferedAmount() == 0 })
+	require.GreaterOrEqual(t, link.client.SRTT(), float64((2*oneWayDelay)/time.Millisecond))
+	rto := time.Duration(link.client.rtoMgr.getRTO() * float64(time.Millisecond))
+	require.Less(t, recoveryBound, rto, "the progress bound must precede fallback T3")
+
+	// Two feedback rounds at 300ms RTT exceed timed500's retransmission
+	// lifetime. That control must skip exactly the lost message with FORWARD-TSN.
+	expectAbandonment := lifetime == 500
+	wantMessages := messageCount
+	if expectAbandonment {
+		wantMessages--
+	}
+	var expected, received []string
+	started := time.Now()
+	nextWrite := started
+	for len(received) < wantMessages && time.Since(started) < recoveryBound {
+		if len(expected) < messageCount && !time.Now().Before(nextWrite) {
+			msg := fmt.Sprintf("ordered-%02d", len(expected))
+			link.write(sender, []byte(msg))
+			expected = append(expected, msg)
+			nextWrite = nextWrite.Add(writeInterval)
+		}
+		tick()
+		for readable() {
+			received = append(received, read())
+		}
+	}
+	elapsed := time.Since(started)
+	var attemptOffsets []time.Duration
+	link.locked(func() {
+		for _, attempt := range attempts {
+			attemptOffsets = append(attemptOffsets, attempt.Sub(started))
+		}
+		require.True(t, targetFound)
+		require.True(t, wireTypeMatches)
+		require.Equal(t, expectAbandonment, sentForwardTSN)
+	})
+	t.Logf("RTT %.1fms, attempts %v, ordered delivery %v, T3 %v", link.client.SRTT(), attemptOffsets, elapsed, rto)
+	require.Len(t, expected, messageCount)
+	if expectAbandonment {
+		require.Len(t, attemptOffsets, 2, "timed500 expires before a second retry can be sent")
+		expected = expected[1:]
+	} else {
+		require.Len(t, attemptOffsets, 3, "the original and first retry are dropped; a second retry must be sent")
+		require.GreaterOrEqual(t, attemptOffsets[2]-attemptOffsets[1], 2*oneWayDelay)
+	}
+	require.GreaterOrEqual(t, attemptOffsets[1]-attemptOffsets[0], 2*oneWayDelay)
+	require.Equal(t, expected, received, "all remaining ordered messages must be read before fallback T3")
+	require.Less(t, elapsed, recoveryBound)
+	require.Zero(t, link.client.stats.getNumT3Timeouts())
+	await("recovered flight acknowledgement", func() bool { return sender.BufferedAmount() == 0 })
+}

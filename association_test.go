@@ -8023,6 +8023,213 @@ func TestRACK_PTO_RearmsT3AfterProbe(t *testing.T) {
 	assert.True(t, ptoDeadline.IsZero(), "the loss probe must not rearm PTO")
 }
 
+func newRackRetryTestAssoc(t *testing.T) *Association {
+	t.Helper()
+	assoc := newRackTestAssoc(t)
+	assoc.minTSN2MeasureRTT = 100
+	t.Cleanup(func() {
+		assoc.closeWriteLoopOnce.Do(func() { close(assoc.closeWriteLoopCh) })
+		assoc.closeAllTimers()
+	})
+
+	return assoc
+}
+
+func TestRACK_LostRetry(t *testing.T) {
+	for _, trigger := range []string{"SACK", "timer"} {
+		for _, tc := range []struct {
+			name                     string
+			sends                    uint32
+			age                      time.Duration
+			queued, acked, abandoned bool
+			wantRetry, wantInList    bool
+		}{
+			{"original", 1, time.Second, false, false, false, true, false},
+			{"retry", 2, time.Second, false, false, false, true, false},
+			{"repeated_retry", 4, time.Second, false, false, false, true, false},
+			{"recent_retry", 2, 400 * time.Millisecond, false, false, false, false, true},
+			{"already_queued", 2, time.Second, true, false, false, true, true},
+			{"acked", 2, time.Second, false, true, false, false, false},
+			{"abandoned", 2, time.Second, false, false, true, false, false},
+		} {
+			t.Run(trigger+"/"+tc.name, func(t *testing.T) {
+				assoc := newRackRetryTestAssoc(t)
+				assoc.lock.Lock()
+				defer assoc.lock.Unlock()
+				assoc.rackReorderingSeen = true
+				assoc.rackReoWnd = 10 * time.Millisecond
+				now := time.Now()
+				chunk := mkChunk(100, now.Add(-tc.age))
+				chunk.nSent, chunk.retransmit, chunk.acked = tc.sends, tc.queued, tc.acked
+				if tc.abandoned {
+					chunk.setAllInflight()
+					chunk.setAbandoned(true)
+				}
+				assoc.inflightQueue.pushNoCheck(chunk)
+				assoc.rackInsert(chunk)
+				delivered := now.Add(-500 * time.Millisecond)
+				if trigger == "SACK" {
+					assoc.onRackAfterSACK(true, delivered, 101, &chunkSelectiveAck{})
+				} else {
+					assoc.rackDeliveredTime = delivered
+					assoc.onRackTimeoutLocked()
+				}
+				require.Equal(t, tc.wantRetry, chunk.retransmit)
+				require.Equal(t, tc.wantInList, chunk.rackInList)
+				require.Equal(t, tc.sends, chunk.nSent, "loss detection must not count as transmission")
+				if tc.queued {
+					require.Empty(t, assoc.awakeWriteLoopCh, "already queued retries must not wake the writer again")
+				}
+			})
+		}
+	}
+}
+
+func TestRACK_RetryACKTimingAndKarn(t *testing.T) {
+	for _, selective := range []bool{false, true} {
+		mode := "cumulative"
+		if selective {
+			mode = "selective"
+		}
+		for _, tc := range []struct {
+			name        string
+			sends       uint32
+			age, minRTT time.Duration
+			credible    bool
+		}{
+			{"original", 1, time.Millisecond, 300 * time.Millisecond, true},
+			{"early_retry", 2, 100 * time.Millisecond, 300 * time.Millisecond, false},
+			{"credible_retry", 2, time.Second, 300 * time.Millisecond, true},
+			{"early_repeated_retry", 3, 100 * time.Millisecond, 300 * time.Millisecond, false},
+			{"credible_repeated_retry", 3, time.Second, 300 * time.Millisecond, true},
+			{"retry_without_RTT", 2, time.Second, 0, true},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				assoc := newRackRetryTestAssoc(t)
+				assoc.lock.Lock()
+				defer assoc.lock.Unlock()
+				assoc.rackReorderingSeen = true
+				assoc.rackReoWnd = 10 * time.Millisecond
+				assoc.rackMinRTT = tc.minRTT
+				now := time.Now()
+				ackTSN, outstandingTSN := uint32(100), uint32(101)
+				if selective {
+					ackTSN, outstandingTSN = outstandingTSN, ackTSN
+				}
+				acknowledged := mkChunk(ackTSN, now.Add(-tc.age))
+				acknowledged.nSent = tc.sends
+				outstanding := mkChunk(outstandingTSN, now.Add(-3*time.Second))
+				if selective {
+					assoc.inflightQueue.pushNoCheck(outstanding)
+					assoc.inflightQueue.pushNoCheck(acknowledged)
+				} else {
+					assoc.inflightQueue.pushNoCheck(acknowledged)
+					assoc.inflightQueue.pushNoCheck(outstanding)
+				}
+				assoc.rackInsert(outstanding)
+				assoc.rackInsert(acknowledged)
+				sack := &chunkSelectiveAck{cumulativeTSNAck: 100, advertisedReceiverWindowCredit: 65536}
+				if selective {
+					sack.cumulativeTSNAck = 99
+					sack.gapAckBlocks = []gapAckBlock{{start: 2, end: 2}}
+				}
+				previousSRTT, previousRTO := assoc.SRTT(), assoc.rtoMgr.getRTO()
+				require.NoError(t, assoc.handleSack(sack))
+				require.Equal(t, tc.credible, !assoc.rackDeliveredTime.IsZero())
+				require.Equal(t, tc.credible, outstanding.retransmit,
+					"an early ACK of an older copy must not declare another transmission lost")
+				_, found := assoc.inflightQueue.get(ackTSN)
+				require.Equal(t, selective, found, "timing ambiguity must not discard the acknowledgement")
+				if selective {
+					require.True(t, acknowledged.acked)
+				}
+				if tc.sends > 1 {
+					require.Equal(t, previousSRTT, assoc.SRTT(), "Karn excludes even credible retries from SRTT")
+					require.Equal(t, previousRTO, assoc.rtoMgr.getRTO())
+					require.Equal(t, uint32(100), assoc.minTSN2MeasureRTT)
+					require.Zero(t, assoc.rack.rackMinRTTWnd.Len(), "retry evidence must not sample minimum RTT")
+				}
+			})
+		}
+	}
+}
+
+func TestRACK_RetryEvidenceAfterWholeSACKRTT(t *testing.T) {
+	for _, mode := range []string{"cumulative", "selective"} {
+		t.Run(mode, func(t *testing.T) {
+			assoc := newRackRetryTestAssoc(t)
+			assoc.lock.Lock()
+			defer assoc.lock.Unlock()
+			assoc.rackMinRTT = 40 * time.Millisecond
+			now := time.Now()
+			retry := mkChunk(100, now.Add(-100*time.Millisecond))
+			retry.nSent = 2
+			original := mkChunk(101, now.Add(-2*time.Second))
+			assoc.inflightQueue.pushNoCheck(retry)
+			assoc.inflightQueue.pushNoCheck(original)
+			assoc.rackInsert(original)
+			assoc.rackInsert(retry)
+			sack := &chunkSelectiveAck{cumulativeTSNAck: 101, advertisedReceiverWindowCredit: 65536}
+			if mode == "selective" {
+				sack.cumulativeTSNAck = 99
+				sack.gapAckBlocks = []gapAckBlock{{start: 1, end: 2}}
+			}
+			require.NoError(t, assoc.handleSack(sack))
+			// The original visited after the retry supplies the current minimum
+			// RTT. The cached 40ms cannot make a 100ms retry ACK credible.
+			require.GreaterOrEqual(t, assoc.rackMinRTT, 2*time.Second)
+			require.Equal(t, original.since, assoc.rackDeliveredTime)
+			require.Equal(t, 1, assoc.rack.rackMinRTTWnd.Len())
+		})
+	}
+}
+
+func TestRACK_RetryReinsertedAfterTransmission(t *testing.T) {
+	for _, trigger := range []string{"SACK", "timer"} {
+		t.Run(trigger, func(t *testing.T) {
+			assoc := newRackRetryTestAssoc(t)
+			assoc.lock.Lock()
+			defer assoc.lock.Unlock()
+			assoc.rackReorderingSeen = true
+			assoc.rackReoWnd = 10 * time.Millisecond
+			chunk := mkChunk(100, time.Now().Add(-time.Second))
+			chunk.nSent = 2
+			assoc.inflightQueue.pushNoCheck(chunk)
+			assoc.rackInsert(chunk)
+			markLost := func(delivered time.Time) {
+				if trigger == "SACK" {
+					assoc.onRackAfterSACK(true, delivered, 101, &chunkSelectiveAck{})
+				} else {
+					assoc.rackDeliveredTime = delivered
+					assoc.onRackTimeoutLocked()
+				}
+			}
+			markLost(chunk.since.Add(500 * time.Millisecond))
+			require.True(t, chunk.retransmit)
+			require.False(t, chunk.rackInList)
+
+			var budget int64
+			var consumed bool
+			beforeRetry := time.Now()
+			require.NotEmpty(t, assoc.getDataPacketsToRetransmit(&budget, &consumed))
+			require.False(t, chunk.retransmit)
+			require.Equal(t, uint32(3), chunk.nSent)
+			require.False(t, chunk.since.Before(beforeRetry))
+			require.False(t, chunk.since.After(time.Now()))
+			require.True(t, chunk.rackInList)
+			require.Same(t, chunk, assoc.rackHead)
+			require.Same(t, chunk, assoc.rackTail)
+
+			// Older delivery evidence cannot immediately lose the new retry.
+			markLost(beforeRetry.Add(-time.Millisecond))
+			require.False(t, chunk.retransmit)
+			markLost(chunk.since.Add(2 * assoc.rackReoWnd))
+			require.True(t, chunk.retransmit, "a lost retry must participate in the next loss scan")
+			require.False(t, chunk.rackInList)
+		})
+	}
+}
+
 func TestFastRecoveryExitOnAckedExitPoint(t *testing.T) {
 	assoc := newRackTestAssoc(t)
 
