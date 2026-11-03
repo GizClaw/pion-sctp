@@ -3219,9 +3219,9 @@ func (a *Association) processSelectiveAck(selectiveAckChunk *chunkSelectiveAck) 
 	// from later gap blocks. A late ACK of the original copy must not make an
 	// implausibly recent retry into RACK delivery evidence (RFC 8985 sec 6.2).
 	// Karn's rule above still excludes every retry from RTT/RTO sampling.
-	if minRTT := a.rack.rackMinRTTWnd.Min(now); minRTT > 0 {
-		a.rackMinRTT = minRTT
-	}
+	// Zero means the window expired; an old cached minimum cannot judge retries
+	// after the path changes, and Karn's rule supplies no replacement sample.
+	a.rackMinRTT = a.rack.rackMinRTTWnd.Min(now)
 	for _, chunk := range newlyAcked {
 		if chunk.nSent > 1 && now.Sub(chunk.since) < a.rackMinRTT {
 			continue
@@ -5134,9 +5134,7 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 	}
 
 	// 2) Maintain ReoWND (RACK for SCTP section 2B)
-	if minRTT := a.rack.rackMinRTTWnd.Min(currTime); minRTT > 0 {
-		a.rackMinRTT = minRTT
-	}
+	a.rackMinRTT = a.rack.rackMinRTTWnd.Min(currTime)
 
 	var base time.Duration
 	if a.rackMinRTT > 0 {
@@ -5177,7 +5175,7 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 	// 3) Compare each outstanding chunk's latest transmission, including retries,
 	// with the latest delivered transmission and the reordering window.
 	if !a.rackDeliveredTime.IsZero() { //nolint:nestif
-		marked := false
+		marked, retryLost := false, false
 
 		for chunk := a.rackHead; chunk != nil; {
 			next := chunk.rackNext // save in case we remove c
@@ -5206,6 +5204,7 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 			// Mark as lost by RACK.
 			chunk.retransmit = true
 			marked = true
+			retryLost = retryLost || chunk.nSent > 1
 
 			// Sending the retry will reinsert it with its new transmission time.
 			a.rackRemove(chunk)
@@ -5217,12 +5216,7 @@ func (a *Association) onRackAfterSACK( // nolint:gocognit,cyclop,gocyclo
 		}
 
 		if marked {
-			// loss detected during active TLR so we must reduce burst
-			if a.tlrActive {
-				a.tlrApplyAdditionalLossLocked(currTime)
-			}
-
-			a.awakeWriteLoop()
+			a.onRackLossLocked(retryLost, currTime)
 		}
 	}
 
@@ -5299,7 +5293,7 @@ func (a *Association) onRackTimeoutLocked() { //nolint:cyclop
 		return
 	}
 
-	marked := false
+	marked, retryLost := false, false
 
 	for chunk := a.rackHead; chunk != nil; {
 		next := chunk.rackNext
@@ -5323,6 +5317,7 @@ func (a *Association) onRackTimeoutLocked() { //nolint:cyclop
 
 		chunk.retransmit = true
 		marked = true
+		retryLost = retryLost || chunk.nSent > 1
 		a.rackRemove(chunk)
 
 		a.log.Tracef("[%s] RACK timer: mark lost tsn=%d", a.name, chunk.tsn)
@@ -5331,13 +5326,26 @@ func (a *Association) onRackTimeoutLocked() { //nolint:cyclop
 	}
 
 	if marked {
-		// loss detected during active TLR so we must reduce burst
-		if a.tlrActive {
-			a.tlrApplyAdditionalLossLocked(time.Now())
-		}
-
-		a.awakeWriteLoop()
+		a.onRackLossLocked(retryLost, time.Now())
 	}
+}
+
+// The caller must hold a.lock. Apply one congestion response per loss scan.
+func (a *Association) onRackLossLocked(retryLost bool, now time.Time) {
+	if retryLost {
+		// RFC 8985 section 9.3: without PRR, a lost retransmission requires
+		// another congestion response, including during fast recovery.
+		a.ssthresh = max32(a.CWND()/2, 4*a.MTU())
+		a.setCWND(a.ssthresh)
+		a.partialBytesAcked = 0
+		a.log.Tracef("[%s] updated cwnd=%d ssthresh=%d inflight=%d (RACK retry)",
+			a.name, a.CWND(), a.ssthresh, a.inflightQueue.getNumBytes())
+	}
+	if a.tlrActive {
+		a.tlrApplyAdditionalLossLocked(now)
+	}
+
+	a.awakeWriteLoop()
 }
 
 func (a *Association) onPTOTimer() {
