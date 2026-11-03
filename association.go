@@ -3954,6 +3954,9 @@ func (a *Association) movePendingDataChunkToInflightQueue(chunkPayload *chunkPay
 	// Assign TSN and original send time
 	chunkPayload.tsn = a.generateNextTSN()
 	chunkPayload.since = time.Now()
+	if chunkPayload.head == nil {
+		chunkPayload.firstSent = chunkPayload.since
+	}
 	a.checkPartialReliabilityStatus(chunkPayload)
 	chunkPayload.nSent = 1
 
@@ -4206,7 +4209,11 @@ func (a *Association) checkPartialReliabilityStatus(chunkPayload *chunkPayloadDa
 				)
 			}
 		} else if stream.reliabilityType == ReliabilityTypeTimed {
-			elapsed := int64(time.Since(chunkPayload.since).Seconds() * 1000)
+			head := chunkPayload
+			if head.head != nil {
+				head = head.head
+			}
+			elapsed := time.Since(head.firstSent).Milliseconds()
 			if elapsed >= int64(stream.reliabilityValue) {
 				chunkPayload.setAbandoned(true)
 				a.rackRemove(chunkPayload)
